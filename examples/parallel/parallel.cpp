@@ -9,6 +9,109 @@
 #include <string>
 #include <vector>
 #include <ctime>
+#include <fstream>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#include <sys/types.h>
+#endif
+
+typedef std::string::const_iterator str_it;
+
+#ifndef _WIN32
+static bool _glob_match(str_it p_it, str_it s_it, const str_it& p_end, const str_it& s_end) {
+    while (p_it != p_end && s_it != s_end) {
+        if (*p_it == '*') {
+            // Skip consecutive '*'
+            while (*std::next(p_it) == '*') {
+                ++p_it;
+            }
+            // Recursively match the rest of the pattern with the rest of the name. Try all possible combinations.
+            for (auto i = s_it; i != s_end; ++i) {
+                if (_glob_match(p_it + 1, i, p_end, s_end)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Mismatch
+        if (*p_it != *s_it) {
+            return false;
+        }
+
+        ++s_it; ++p_it;
+    }
+
+    // Match
+    if (p_it == p_end && s_it == s_end) {
+        return true;
+    }
+
+    // Handle remaining characters in pattern or name.
+
+    // There is still some string left, but the pattern is exhausted.
+    if (p_it == p_end) {
+        return false;
+    }
+
+    // There is still some pattern left, but the string is exhausted. Check
+    // whether the pattern is wildcards only. (i.e. pattern = '***' matches empty string)
+    if (s_it == s_end) {
+        while (p_it != p_end) {
+            if (*p_it != '*') {
+                return false;
+            }
+            ++p_it;
+        }
+        return true;
+    }
+
+    return false; // We should never reach this point.
+}
+
+static bool glob_match(const std::string& pattern, const std::string& s) {
+    return _glob_match(pattern.begin(), s.begin(), pattern.end(), s.end());
+}
+#endif // #ifndef _WIN32
+
+static std::vector<std::string> simple_glob(const std::string& search_dir, const std::string& pattern) {
+#ifdef _WIN32
+    // XXX: I don't have a windows machine to test whether this compiles/works...
+    std::vector<std::string> names;
+    string search_path = folder + DIRECTORY_SEPARATOR + pattern;
+    WIN32_FIND_DATA fd;
+    HANDLE hFind = ::FindFirstFile(search_path.c_str(), &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                names.push_back(std::string(fd.cFileName));
+            }
+        } while (::FindNextFile(hFind, &fd));
+        ::FindClose(hFind);
+    }
+    return names;
+#else
+    // Use C/POSIX API since we do not have a C++17 filesystem library.
+    std::vector<std::string> names;
+    DIR* dirp = opendir(search_dir.c_str());
+    if (dirp == NULL) {
+        return names;
+    }
+    struct dirent* dp;
+    while ((dp = readdir(dirp)) != NULL) {
+        if (glob_match(pattern, dp->d_name)) {
+            names.push_back(std::string(dp->d_name));
+        }
+    }
+    closedir(dirp);
+    return names;
+#endif
+
+}
+
 
 // trim whitespace from the beginning and end of a string
 static std::string trim(const std::string & str) {
@@ -95,8 +198,20 @@ static std::vector<std::string> split_string(const std::string& input, char deli
     return tokens;
 }
 
+// Returns the common prefix of all the strings in the vector v
+static std::string common_prefix(const std::vector<std::string> &v) {
+    for (size_t i = 0; i < v[0].size(); ++i) {
+        for (auto &s : v) {
+            if (s.size() <= i || s[i] != v[0][i]) {
+                return v[0].substr(0, i);
+            }
+        }
+    }
+    return v[0];
+}
+
 int main(int argc, char ** argv) {
-    srand(1234);
+    srand(time(NULL));
 
     gpt_params params;
 
@@ -106,9 +221,6 @@ int main(int argc, char ** argv) {
 
     // number of simultaneous "clients" to simulate
     const int32_t n_clients = params.n_parallel;
-
-    // requests to simulate
-    const int32_t n_seq = params.n_sequences;
 
     // insert new requests as soon as the previous one is done
     const bool cont_batching = params.cont_batching;
@@ -129,25 +241,70 @@ int main(int argc, char ** argv) {
     llama_context * ctx = NULL;
 
     // load the target model
-    params.logits_all = true;
+    // params.logits_all = true; // Do we need this?
     std::tie(model, ctx) = llama_init_from_gpt_params(params);
 
+    std::vector<std::string> matched_paths;
+
     // load the prompts from an external file if there are any
-    if (params.prompt.empty()) {
+    if (params.prompt_file.empty() && params.prompt.empty()) {
         printf("\n\033[32mNo new questions so proceed with build-in defaults.\033[0m\n");
     } else {
-        // Output each line of the input params.prompts vector and copy to k_prompts
-        int index = 0;
-        printf("\n\033[32mNow printing the external prompt file %s\033[0m\n\n", params.prompt_file.c_str());
+        // If prompt_file looks like a directory
+        if (!directory_exists(params.prompt_file)) {
+            // Output each line of the input params.prompts vector and copy to k_prompts
+            int index = 0;
+            printf("\n\033[32mNow printing the external prompt file %s\033[0m\n\n", params.prompt_file.c_str());
 
-        std::vector<std::string> prompts = split_string(params.prompt, '\n');
-        for (const auto& prompt : prompts) {
-            k_prompts.resize(index + 1);
-            k_prompts[index] = prompt;
-            index++;
-            printf("%3d prompt: %s\n", index, prompt.c_str());
+            std::vector<std::string> prompts = split_string(params.prompt, '\n');
+            for (const auto& prompt : prompts) {
+                k_prompts.resize(index + 1);
+                k_prompts[index] = prompt;
+                index++;
+                printf("%3d prompt: %s\n", index, prompt.c_str());
+            }
+        } else {
+            matched_paths = simple_glob(params.prompt_file, params.prompt);
+            if (matched_paths.empty()) {
+                LOG_TEE("No files matched %s found in the directory %s\n", params.prompt.c_str(), params.prompt_file.c_str());
+                return 1;
+            }
+            // For each file, read the content and add it to the prompts
+            k_prompts.resize(matched_paths.size());
+
+            for (size_t i = 0; i < matched_paths.size(); ++i) {
+                // join the path onto params.prompt_file
+                auto full_path = params.prompt_file + DIRECTORY_SEPARATOR + matched_paths[i];
+
+                LOG_TEE("Loading prompts from %s\n", full_path.c_str());
+
+                auto file = std::ifstream(full_path.c_str());
+                if (!file.is_open()) {
+                    LOG_TEE("Failed to open %s\n", full_path.c_str());
+                    return 1;
+                }
+
+                // Read all the data into a string
+                std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+                k_prompts[i] = content;
+            }
+
+            // Find the common prefix of all the strings in the vector k_prompts
+            auto prefix = common_prefix(k_prompts);
+            LOG_TEE("Common prefix of all the strings in the vector k_prompts: %s\n", prefix.c_str());
+
+            // Add the common prefix to system prompt
+            k_system = prefix;
+
+            // Remove the common prefix from all the strings in the vector k_prompts
+            for (auto &s : k_prompts) {
+                s = s.substr(prefix.size());
+            }
         }
     }
+
+    // requests to simulate
+    const int32_t n_seq = std::max(params.n_sequences, (int32_t) k_prompts.size());
 
     fprintf(stderr, "\n\n");
     fflush(stderr);
@@ -244,8 +401,13 @@ int main(int argc, char ** argv) {
                     client.t_start_prompt = ggml_time_us();
                     client.t_start_gen    = 0;
 
-                    client.input    = k_prompts[rand() % k_prompts.size()];
-                    client.prompt   = client.input + "\nAssistant:";
+                    if (matched_paths.empty()) {
+                        client.input    = k_prompts[rand() % k_prompts.size()];
+                        client.prompt   = client.input + "\nAssistant:";
+                    } else {
+                        client.input    = ::trim(k_prompts[g_seq_id % k_prompts.size()]);
+                        client.prompt   = client.input;
+                    }
                     client.response = "";
 
                     llama_sampling_reset(client.ctx_sampling);
@@ -358,8 +520,11 @@ int main(int argc, char ** argv) {
                         (id == llama_token_eos(model) ||
                          (params.n_predict > 0 && client.n_decoded + client.n_prompt >= params.n_predict) ||
                          client.response.find("User:") != std::string::npos ||
-                         client.response.find('\n') != std::string::npos)) {
+                         (client.response.find('\n') != std::string::npos && matched_paths.empty()))) {
                     // basic reverse prompt
+
+                    LOG("client.n_decoded %d, id == llama_token_eos(model) %d, client.response.find(\"User:\") %ld, client.response.find('\\n') %ld\n",
+                            client.n_decoded, id == llama_token_eos(model), client.response.find("User:"), client.response.find('\n'));
                     const size_t pos = client.response.find("User:");
                     if (pos != std::string::npos) {
                         client.response = client.response.substr(0, pos);
@@ -370,13 +535,25 @@ int main(int argc, char ** argv) {
 
                     const auto t_main_end = ggml_time_us();
 
-                    LOG_TEE("\033[31mClient %3d, seq %3d/%3d, prompt %4d t, response %4d t, time %5.2f s, speed %5.2f t/s, cache miss %d \033[0m \nInput:    %s\n\033[35mResponse: %s\033[0m\n\n",
-                            client.id, client.seq_id, n_seq, client.n_prompt, client.n_decoded,
-                            (t_main_end - client.t_start_prompt) / 1e6,
-                            (double) (client.n_prompt + client.n_decoded) / (t_main_end - client.t_start_prompt) * 1e6,
-                            n_cache_miss,
-                            ::trim(client.input).c_str(),
-                            ::trim(client.response).c_str());
+                    if (matched_paths.empty()) {
+                        LOG_TEE("\033[31mClient %3d, seq %3d/%3d, prompt %4d t, response %4d t, time %5.2f s, speed %5.2f t/s, cache miss %d \033[0m \nInput:    %s\n\033[35mResponse: %s\033[0m\n\n",
+                                client.id, client.seq_id, n_seq, client.n_prompt, client.n_decoded,
+                                (t_main_end - client.t_start_prompt) / 1e6,
+                                (double) (client.n_prompt + client.n_decoded) / (t_main_end - client.t_start_prompt) * 1e6,
+                                n_cache_miss,
+                                ::trim(client.input).c_str(),
+                                ::trim(client.response).c_str());
+                    } else {
+                        // Get file name from the matched_paths
+                        std::string file_name = params.prompt_file + DIRECTORY_SEPARATOR + matched_paths[client.seq_id] + ".out.tmp";
+                        LOG_TEE("Writing the response to %s\n", file_name.c_str());
+                        // Write the response to a file
+                        std::ofstream file(file_name);
+                        file << k_system;
+                        file << client.input;
+                        file << client.response;
+                        file.close();
+                    }
 
                     n_total_prompt += client.n_prompt;
                     n_total_gen    += client.n_decoded;

@@ -233,17 +233,25 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
                 invalid_param = true;
                 break;
             }
-            std::ifstream file(argv[i]);
-            if (!file) {
-                fprintf(stderr, "error: failed to open file '%s'\n", argv[i]);
-                invalid_param = true;
-                break;
-            }
-            // store the external file name in params
-            params.prompt_file = argv[i];
-            std::copy(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>(), back_inserter(params.prompt));
-            if (!params.prompt.empty() && params.prompt.back() == '\n') {
-                params.prompt.pop_back();
+
+            if (directory_exists(argv[i])) {
+                // Used by parallel inference in examples/parallel/parallel.cpp
+                // to specify a directory of prompts. The -p option is used to
+                // specify the filenames as wildcards eg `-p '*.txt'`.
+                params.prompt_file = argv[i];
+            } else {
+                std::ifstream file(argv[i]);
+                if (!file) {
+                    fprintf(stderr, "error: failed to open file '%s'\n", argv[i]);
+                    invalid_param = true;
+                    break;
+                }
+                // store the external file name in params
+                params.prompt_file = argv[i];
+                std::copy(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>(), back_inserter(params.prompt));
+                if (!params.prompt.empty() && params.prompt.back() == '\n') {
+                    params.prompt.pop_back();
+                }
             }
         } else if (arg == "-n" || arg == "--n-predict") {
             if (++i >= argc) {
@@ -1449,6 +1457,17 @@ bool llama_should_add_bos_token(const llama_model * model) {
     const int add_bos = llama_add_bos_token(model);
 
     return add_bos != -1 ? bool(add_bos) : (llama_vocab_type(model) == LLAMA_VOCAB_TYPE_SPM);
+}
+
+bool directory_exists(const std::string & path) {
+#ifdef _WIN32
+    // XXX: I don't have a windows machine to test this...
+    DWORD dwAttrib = GetFileAttributes(path.c_str());
+    return (dwAttrib != INVALID_FILE_ATTRIBUTES && (dwAttrib & FILE_ATTRIBUTE_DIRECTORY));
+#else
+    struct stat info;
+    return stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
+#endif
 }
 
 //

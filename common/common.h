@@ -235,6 +235,10 @@ std::string llama_detokenize_bpe(
 // defaults to true when model type is SPM, otherwise false.
 bool llama_should_add_bos_token(const llama_model * model);
 
+// Returns true if the directory exists at path. The format of the path string
+// is platform dependent.
+bool directory_exists(const std::string & path);
+
 //
 // YAML utils
 //
