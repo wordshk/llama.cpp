@@ -291,15 +291,24 @@ int main(int argc, char ** argv) {
 
             // Find the common prefix of all the strings in the vector k_prompts
             auto prefix = common_prefix(k_prompts);
-            LOG_TEE("Common prefix of all the strings in the vector k_prompts: %s\n", prefix.c_str());
 
-            // Add the common prefix to system prompt
-            k_system = prefix;
+            // Hack to avoid the system prompt being greater than params.n_batch tokens
+            size_t cut_off = prefix.size();
+            while (::llama_tokenize(ctx, prefix.substr(0, cut_off), true).size() >= (unsigned long) params.n_batch) {
+                // Cut off the last line
+                cut_off = prefix.find_last_of('\n', cut_off - 1);
+            }
+
+            prefix = prefix.substr(0, cut_off);
+            LOG_TEE("Common prefix of all the strings in the vector k_prompts (after cut_off): %s\n", prefix.c_str());
 
             // Remove the common prefix from all the strings in the vector k_prompts
             for (auto &s : k_prompts) {
                 s = s.substr(prefix.size());
             }
+
+            // Add the common prefix to system prompt
+            k_system = prefix;
         }
     }
 
@@ -345,6 +354,20 @@ int main(int argc, char ** argv) {
 
         for (int32_t i = 0; i < n_tokens_system; ++i) {
             llama_batch_add(batch, tokens_system[i], i, { 0 }, false);
+            // Doesn't seem to work, dunno why, maybe some kv-cache thing that
+            // I don't understand about. For now, just ensure k_system does not
+            // exceed n_batch
+            /*
+
+            if ((i + 1) % params.n_batch == 0) {
+                // Decode the batch because it is already full
+                if (llama_decode(ctx, batch) != 0) {
+                    LOG_TEE("%s: llama_decode() failed\n", __func__);
+                    return 1;
+                }
+                llama_batch_clear(batch);
+            }
+            */
         }
 
         if (llama_decode(ctx, batch) != 0) {
